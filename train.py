@@ -380,7 +380,6 @@ def train(args):
         collate_fn=f5_collate_fn if use_f5_dataset else custom_collate_fn,
         num_workers=0,  # Avoid multiprocessing issues on Windows
         pin_memory=True if device == "cuda" else False,
-        drop_last=True,
     )
 
     total_updates = args.epochs * len(loader)
