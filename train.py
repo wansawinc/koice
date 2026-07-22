@@ -358,7 +358,6 @@ def train(args):
                 "duration": dur,
             })
             durations.append(dur)
-            durations.append(dur)
 
         train_ds = CustomDataset(
             rows,
@@ -444,6 +443,18 @@ def train(args):
         epoch_losses = []
 
         for batch_idx, batch in enumerate(loader):
+            # Debug: print batch info on first batch of first epoch
+            if epoch == start_epoch and batch_idx == 0:
+                print(f"  [DEBUG] Batch keys: {list(batch.keys()) if isinstance(batch, dict) else type(batch)}")
+                if isinstance(batch, dict):
+                    for k, v in batch.items():
+                        if hasattr(v, 'shape'):
+                            print(f"  [DEBUG]   {k}: shape={v.shape}, dtype={v.dtype}")
+                        elif isinstance(v, list):
+                            print(f"  [DEBUG]   {k}: list len={len(v)}")
+                        else:
+                            print(f"  [DEBUG]   {k}: {type(v)}")
+
             if use_f5_dataset:
                 # F5-TTS CustomDataset returns mel + text in batch
                 mel = batch["mel"].to(device)  # (B, n_mels, T)
