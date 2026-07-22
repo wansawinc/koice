@@ -1,3 +1,5 @@
 raw/
 audio/
 data/
+training/vocab.txt
+training/train.log

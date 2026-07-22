@@ -239,19 +239,20 @@ def download_and_load_model(vocab_path: Path, device: str):
 
     # Handle text_embed size mismatch: if our vocab is larger than pretrained,
     # copy pretrained weights into the first N rows and randomly init the rest.
+    # The model's actual embedding size may differ from vocab_size (DiT adds +1 internally)
     embed_key = "transformer.text_embed.text_embed.weight"
     if embed_key in cleaned:
-        pretrained_embed = cleaned[embed_key]  # (pretrained_vocab_size, 512)
+        pretrained_embed = cleaned[embed_key]  # (pretrained_vocab_size, embed_dim)
         pretrained_size = pretrained_embed.shape[0]
-        if vocab_size > pretrained_size:
-            print(f"  Extending text embedding: {pretrained_size} -> {vocab_size} (+{vocab_size - pretrained_size} new chars)")
-            new_embed = torch.randn(vocab_size, pretrained_embed.shape[1]) * 0.02
-            new_embed[:pretrained_size] = pretrained_embed
+        # Get the actual size the model expects
+        model_embed_size = model.state_dict()[embed_key].shape[0]
+        if model_embed_size != pretrained_size:
+            print(f"  Resizing text embedding: {pretrained_size} -> {model_embed_size}")
+            new_embed = torch.randn(model_embed_size, pretrained_embed.shape[1]) * 0.02
+            # Copy pretrained weights for the overlapping portion
+            copy_size = min(pretrained_size, model_embed_size)
+            new_embed[:copy_size] = pretrained_embed[:copy_size]
             cleaned[embed_key] = new_embed
-        elif vocab_size < pretrained_size:
-            # Shouldn't happen with our approach, but handle it
-            print(f"  Trimming text embedding: {pretrained_size} -> {vocab_size}")
-            cleaned[embed_key] = pretrained_embed[:vocab_size]
 
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
     print(f"  Loaded {len(cleaned)} tensors (skipped {skipped} bookkeeping)")
@@ -324,13 +325,15 @@ def train(args):
         rows = []
         durations = []
         for entry in dataset.entries:
-            rows.append({
-                "audio_path": entry["audio_path"],
-                "text": entry["text"],
-            })
             # Get duration
             info = torchaudio.info(entry["audio_path"])
             dur = info.num_frames / info.sample_rate
+            rows.append({
+                "audio_path": entry["audio_path"],
+                "text": entry["text"],
+                "duration": dur,
+            })
+            durations.append(dur)
             durations.append(dur)
 
         train_ds = CustomDataset(
