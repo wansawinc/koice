@@ -192,9 +192,9 @@ class KashmiriTTSDataset(torch.utils.data.Dataset):
                 parts = line.split("|", 1)
                 if len(parts) == 2:
                     audio_path, text = parts
-                    # Handle both absolute and relative paths
-                    # Always resolve to local wavs/ folder using just the filename
-                    audio_file = Path(audio_path).name  # e.g. audio0000001.wav
+                    # Handle both absolute and relative paths (cross-platform)
+                    # Extract filename regardless of Windows/Linux path separators
+                    audio_file = audio_path.replace("\\", "/").split("/")[-1]
                     resolved_path = wavs_dir / audio_file
                     if resolved_path.exists() and text.strip():
                         self.entries.append({
