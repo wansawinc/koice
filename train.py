@@ -62,8 +62,9 @@ except (OSError, ImportError):
     import soundfile as sf
     print("WARNING: torchaudio unavailable, using soundfile fallback")
 
-    # Create a minimal torchaudio stub so f5_tts.model.dataset can import it
+    # Create a comprehensive torchaudio stub so f5_tts internals work
     import types as _types
+
     _torchaudio_stub = _types.ModuleType("torchaudio")
 
     def _sf_load(filepath, **kwargs):
@@ -88,22 +89,122 @@ except (OSError, ImportError):
     _torchaudio_stub.load = _sf_load
     _torchaudio_stub.info = _sf_info
 
-    # Stub transforms
+    # Stub transforms with actual MelSpectrogram using torch
     _transforms = _types.ModuleType("torchaudio.transforms")
+
     class _Resample(torch.nn.Module):
         def __init__(self, orig_freq, new_freq):
             super().__init__()
             self.orig_freq = orig_freq
             self.new_freq = new_freq
         def forward(self, waveform):
-            # Basic resampling via interpolation
             ratio = self.new_freq / self.orig_freq
             new_length = int(waveform.shape[-1] * ratio)
             return torch.nn.functional.interpolate(
                 waveform.unsqueeze(0), size=new_length, mode="linear", align_corners=False
             ).squeeze(0)
 
+    class _MelSpectrogram(torch.nn.Module):
+        """Pure PyTorch MelSpectrogram (no torchaudio dependency)."""
+        def __init__(self, sample_rate=24000, n_fft=1024, win_length=1024,
+                     hop_length=256, n_mels=100, power=1, center=True,
+                     pad_mode="reflect", norm="slaney", mel_scale="slaney", **kwargs):
+            super().__init__()
+            self.n_fft = n_fft
+            self.win_length = win_length or n_fft
+            self.hop_length = hop_length
+            self.center = center
+            self.pad_mode = pad_mode
+            self.power = power
+
+            # Create mel filterbank
+            mel_fb = self._create_mel_filterbank(sample_rate, n_fft, n_mels, norm, mel_scale)
+            self.register_buffer("mel_fb", mel_fb)
+
+            window = torch.hann_window(self.win_length)
+            self.register_buffer("window", window)
+
+        def _create_mel_filterbank(self, sr, n_fft, n_mels, norm, mel_scale):
+            """Create mel filterbank matrix."""
+            def hz_to_mel(hz):
+                if mel_scale == "slaney":
+                    if hz < 1000:
+                        return 3.0 * hz / 200.0
+                    else:
+                        return 15.0 + 27.0 * math.log(hz / 1000.0) / math.log(6.4)
+                return 2595.0 * math.log10(1.0 + hz / 700.0)
+
+            def mel_to_hz(mel):
+                if mel_scale == "slaney":
+                    if mel < 15.0:
+                        return 200.0 * mel / 3.0
+                    else:
+                        return 1000.0 * math.exp((mel - 15.0) * math.log(6.4) / 27.0)
+                return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+            import math
+
+            f_min = 0.0
+            f_max = sr / 2.0
+            mel_min = hz_to_mel(f_min)
+            mel_max = hz_to_mel(f_max)
+
+            mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
+            hz_points = torch.tensor([mel_to_hz(m.item()) for m in mel_points])
+            bin_points = torch.floor((n_fft + 1) * hz_points / sr).long()
+
+            n_freqs = n_fft // 2 + 1
+            fb = torch.zeros(n_freqs, n_mels)
+
+            for i in range(n_mels):
+                left = bin_points[i]
+                center = bin_points[i + 1]
+                right = bin_points[i + 2]
+
+                for j in range(left, center):
+                    if center != left:
+                        fb[j, i] = (j - left) / (center - left)
+                for j in range(center, right):
+                    if right != center:
+                        fb[j, i] = (right - j) / (right - center)
+
+            if norm == "slaney":
+                enorm = 2.0 / (hz_points[2:n_mels+2] - hz_points[:n_mels])
+                fb *= enorm.unsqueeze(0)
+
+            return fb  # (n_freqs, n_mels)
+
+        def forward(self, waveform):
+            if self.center:
+                pad_amount = self.n_fft // 2
+                waveform = torch.nn.functional.pad(waveform, (pad_amount, pad_amount), mode=self.pad_mode)
+
+            # STFT
+            spec = torch.stft(
+                waveform.squeeze(0) if waveform.dim() > 1 else waveform,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window.to(waveform.device),
+                return_complex=True,
+            )
+            # Power/magnitude spectrogram
+            if self.power == 1:
+                spec = spec.abs()
+            else:
+                spec = spec.abs().pow(self.power)
+
+            # Apply mel filterbank
+            mel_fb = self.mel_fb.to(spec.device)
+            if spec.dim() == 2:
+                mel_spec = torch.matmul(spec.T, mel_fb).T  # (n_mels, time)
+            else:
+                mel_spec = torch.matmul(spec.transpose(-1, -2), mel_fb).transpose(-1, -2)
+
+            return mel_spec
+
     _transforms.Resample = _Resample
+    _transforms.MelSpectrogram = _MelSpectrogram
     _torchaudio_stub.transforms = _transforms
 
     # Stub functional
@@ -152,7 +253,7 @@ DEFAULT_BATCH_SIZE = 4  # Adjust based on your GPU VRAM
 DEFAULT_LR = 7.5e-5
 DEFAULT_WARMUP_STEPS = 200
 DEFAULT_GRAD_CLIP = 1.0
-DEFAULT_SAVE_EVERY_N_EPOCHS = 5
+DEFAULT_SAVE_EVERY_N_EPOCHS = 20
 
 
 # ============================================================
