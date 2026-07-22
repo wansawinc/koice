@@ -383,7 +383,8 @@ def train(args):
     )
 
     total_updates = args.epochs * len(loader)
-    print(f"\n  Batches per epoch: {len(loader)}")
+    print(f"\n  Dataset size: {len(train_ds)}")
+    print(f"  Batches per epoch: {len(loader)}")
     print(f"  Total training steps: {total_updates}")
 
     # Optimizer + Scheduler
