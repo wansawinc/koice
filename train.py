@@ -159,6 +159,30 @@ class KashmiriTTSDataset(torch.utils.data.Dataset):
         # Resolve wavs dir relative to metadata.csv location
         wavs_dir = metadata_csv.parent / "wavs"
 
+        if not wavs_dir.exists():
+            print(f"  WARNING: wavs/ dir not found at: {wavs_dir}")
+            print(f"  Looking for alternatives...")
+            # Try common alternatives
+            alternatives = [
+                metadata_csv.parent.parent / "wavs",  # one level up
+                metadata_csv.parent.parent / "dataset" / "wavs",
+                metadata_csv.parent.parent / "raw" / "segments",  # segments folder
+            ]
+            for alt in alternatives:
+                if alt.exists():
+                    wavs_dir = alt
+                    print(f"  Found wavs at: {wavs_dir}")
+                    break
+            else:
+                print(f"  ERROR: Cannot find wavs directory!")
+                print(f"  Expected at: {metadata_csv.parent / 'wavs'}")
+
+        print(f"  Wavs directory: {wavs_dir}")
+        print(f"  Wavs dir exists: {wavs_dir.exists()}")
+        if wavs_dir.exists():
+            wav_count = len(list(wavs_dir.glob("*.wav")))
+            print(f"  WAV files found: {wav_count}")
+
         with open(metadata_csv, "r", encoding="utf-8") as f:
             header = f.readline()  # skip header
             for line in f:
