@@ -9,7 +9,8 @@ Single-file training script that:
 5. Saves checkpoints to training/ folder
 
 Requirements:
-    pip install f5-tts torch torchaudio cached-path safetensors omegaconf soundfile
+pip install f5-tts torch torchaudio cached-path safetensors omegaconf soundfile numpy    
+
 
 Usage:
     python train.py                          # Start training
@@ -97,41 +98,46 @@ DEFAULT_SAVE_EVERY_N_EPOCHS = 5
 # ============================================================
 def build_kashmiri_vocab(metadata_csv: Path, output_path: Path):
     """
-    Build a character-level vocab from the dataset transcriptions.
-    Includes all unique characters found in the Kashmiri text plus
-    standard punctuation and space.
+    Start from the pretrained F5-TTS vocab (preserving exact order and entries),
+    then append any new Kashmiri characters not already present.
+    This ensures the text_embed layer stays compatible with pretrained weights.
     """
-    chars = set()
+    # Load original vocab exactly as-is (preserves order + multi-char tokens)
+    orig_vocab_path = str(cached_path(PRETRAINED_VOCAB))
+    original_lines = []
+    original_chars = set()
+    with open(orig_vocab_path, "r", encoding="utf-8") as f:
+        for line in f:
+            entry = line.strip()
+            if entry:
+                original_lines.append(entry)
+                original_chars.add(entry)
 
+    print(f"  Original vocab size: {len(original_lines)}")
+
+    # Collect Kashmiri characters from dataset
+    kashmiri_chars = set()
     with open(metadata_csv, "r", encoding="utf-8") as f:
         header = f.readline()  # skip header
         for line in f:
             parts = line.strip().split("|", 1)
             if len(parts) == 2:
                 text = parts[1]
-                chars.update(text)
+                kashmiri_chars.update(text)
 
-    # Also load the original F5-TTS vocab to include its characters
-    # This helps with any code-switching or shared characters
-    try:
-        orig_vocab_path = str(cached_path(PRETRAINED_VOCAB))
-        with open(orig_vocab_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    chars.update(line)
-    except Exception as e:
-        print(f"  Warning: Could not load original vocab: {e}")
+    # Find new characters not in original vocab
+    new_chars = sorted(kashmiri_chars - original_chars)
+    print(f"  New Kashmiri characters to add: {len(new_chars)}")
 
-    # Sort for reproducibility
-    vocab_chars = sorted(chars)
-
-    # Write vocab file (one char per line)
+    # Write: original vocab first (unchanged), then new chars appended
     with open(output_path, "w", encoding="utf-8") as f:
-        for ch in vocab_chars:
+        for entry in original_lines:
+            f.write(entry + "\n")
+        for ch in new_chars:
             f.write(ch + "\n")
 
-    print(f"  Vocab size: {len(vocab_chars)} characters")
+    total_size = len(original_lines) + len(new_chars)
+    print(f"  Final vocab size: {total_size} characters")
     print(f"  Saved to: {output_path}")
     return output_path
 
@@ -231,11 +237,26 @@ def download_and_load_model(vocab_path: Path, device: str):
         else:
             skipped += 1
 
-    # Load with strict=False because vocab size might differ
+    # Handle text_embed size mismatch: if our vocab is larger than pretrained,
+    # copy pretrained weights into the first N rows and randomly init the rest.
+    embed_key = "transformer.text_embed.text_embed.weight"
+    if embed_key in cleaned:
+        pretrained_embed = cleaned[embed_key]  # (pretrained_vocab_size, 512)
+        pretrained_size = pretrained_embed.shape[0]
+        if vocab_size > pretrained_size:
+            print(f"  Extending text embedding: {pretrained_size} -> {vocab_size} (+{vocab_size - pretrained_size} new chars)")
+            new_embed = torch.randn(vocab_size, pretrained_embed.shape[1]) * 0.02
+            new_embed[:pretrained_size] = pretrained_embed
+            cleaned[embed_key] = new_embed
+        elif vocab_size < pretrained_size:
+            # Shouldn't happen with our approach, but handle it
+            print(f"  Trimming text embedding: {pretrained_size} -> {vocab_size}")
+            cleaned[embed_key] = pretrained_embed[:vocab_size]
+
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
     print(f"  Loaded {len(cleaned)} tensors (skipped {skipped} bookkeeping)")
     if missing:
-        print(f"  Missing keys: {len(missing)} (expected if vocab size changed)")
+        print(f"  Missing keys: {len(missing)}")
     if unexpected:
         print(f"  Unexpected keys: {len(unexpected)}")
 
