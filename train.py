@@ -48,10 +48,72 @@ _datasets_stub.load_from_disk = lambda *a, **kw: (_ for _ in ()).throw(
 sys.modules.setdefault("datasets", _datasets_stub)
 
 import torch
-import torchaudio
 import numpy as np
 from cached_path import cached_path
 from safetensors.torch import load_file, save_file
+
+# torchaudio may not work on all platforms (Kaggle CUDA mismatch)
+# Use soundfile as fallback for audio loading
+try:
+    import torchaudio
+    TORCHAUDIO_AVAILABLE = True
+except (OSError, ImportError):
+    TORCHAUDIO_AVAILABLE = False
+    import soundfile as sf
+    print("WARNING: torchaudio unavailable, using soundfile fallback")
+
+    # Create a minimal torchaudio stub so f5_tts.model.dataset can import it
+    import types as _types
+    _torchaudio_stub = _types.ModuleType("torchaudio")
+
+    def _sf_load(filepath, **kwargs):
+        """soundfile-based replacement for torchaudio.load"""
+        data, sample_rate = sf.read(filepath, dtype="float32")
+        waveform = torch.from_numpy(data)
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        else:
+            waveform = waveform.T  # (channels, samples)
+        return waveform, sample_rate
+
+    def _sf_info(filepath):
+        """soundfile-based replacement for torchaudio.info"""
+        info = sf.info(filepath)
+        _info = _types.SimpleNamespace(
+            num_frames=info.frames,
+            sample_rate=info.samplerate,
+        )
+        return _info
+
+    _torchaudio_stub.load = _sf_load
+    _torchaudio_stub.info = _sf_info
+
+    # Stub transforms
+    _transforms = _types.ModuleType("torchaudio.transforms")
+    class _Resample(torch.nn.Module):
+        def __init__(self, orig_freq, new_freq):
+            super().__init__()
+            self.orig_freq = orig_freq
+            self.new_freq = new_freq
+        def forward(self, waveform):
+            # Basic resampling via interpolation
+            ratio = self.new_freq / self.orig_freq
+            new_length = int(waveform.shape[-1] * ratio)
+            return torch.nn.functional.interpolate(
+                waveform.unsqueeze(0), size=new_length, mode="linear", align_corners=False
+            ).squeeze(0)
+
+    _transforms.Resample = _Resample
+    _torchaudio_stub.transforms = _transforms
+
+    # Stub functional
+    _functional = _types.ModuleType("torchaudio.functional")
+    _torchaudio_stub.functional = _functional
+
+    sys.modules["torchaudio"] = _torchaudio_stub
+    sys.modules["torchaudio.transforms"] = _transforms
+    sys.modules["torchaudio.functional"] = _functional
+    torchaudio = _torchaudio_stub
 
 # ============================================================
 # CONFIGURATION
@@ -296,11 +358,35 @@ def download_and_load_model(vocab_path: Path, device: str):
 def train(args):
     TRAINING_DIR.mkdir(parents=True, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    if device == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    # Detect multi-GPU and use accelerate if available
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_accelerate = False
+    accelerator = None
+
+    if num_gpus > 1:
+        try:
+            from accelerate import Accelerator
+            accelerator = Accelerator(mixed_precision="fp16")
+            use_accelerate = True
+            device = accelerator.device
+            print(f"Device: {device} (using accelerate with {num_gpus} GPUs)")
+            for i in range(num_gpus):
+                print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
+                      f"({torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB)")
+        except ImportError:
+            print(f"WARNING: {num_gpus} GPUs detected but 'accelerate' not installed.")
+            print(f"  Install with: pip install accelerate")
+            print(f"  Falling back to single GPU.")
+            device = "cuda"
+            print(f"Device: {device}")
+            print(f"  GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Device: {device}")
+        if device == "cuda":
+            print(f"  GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     # Build vocab from dataset
     print("\n" + "=" * 60)
@@ -336,15 +422,18 @@ def train(args):
     try:
         from f5_tts.model.dataset import CustomDataset, collate_fn as f5_collate_fn
 
-        # Get durations - handle different torchaudio versions
+        # Get durations - handle different torchaudio versions / fallback to soundfile
         def get_audio_duration(path):
-            try:
-                info = torchaudio.info(path)
-                return info.num_frames / info.sample_rate
-            except AttributeError:
-                # Older torchaudio versions don't have torchaudio.info
-                waveform, sr = torchaudio.load(path)
-                return waveform.shape[1] / sr
+            if TORCHAUDIO_AVAILABLE:
+                try:
+                    info = torchaudio.info(path)
+                    return info.num_frames / info.sample_rate
+                except (AttributeError, RuntimeError):
+                    waveform, sr = torchaudio.load(path)
+                    return waveform.shape[1] / sr
+            else:
+                data, sr = sf.read(path)
+                return len(data) / sr
 
         # Build rows in the format CustomDataset expects
         rows = []
@@ -372,13 +461,14 @@ def train(args):
         sys.exit(1)
 
     # DataLoader
+    is_cuda = (device == "cuda") if isinstance(device, str) else (str(device).startswith("cuda"))
     loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=f5_collate_fn,
         num_workers=0,  # Avoid multiprocessing issues on Windows
-        pin_memory=True if device == "cuda" else False,
+        pin_memory=is_cuda,
     )
 
     total_updates = args.epochs * len(loader)
@@ -423,8 +513,17 @@ def train(args):
     log_file = open(log_path, "a", encoding="utf-8")
 
     # Mixed precision for faster training
-    use_amp = device == "cuda"
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    # When using accelerate, it handles AMP internally
+    if use_accelerate:
+        model, optimizer, loader, scheduler = accelerator.prepare(
+            model, optimizer, loader, scheduler
+        )
+        use_amp = False  # accelerate handles this
+        scaler = None
+        print(f"  Multi-GPU: accelerate prepared (fp16 handled internally)")
+    else:
+        use_amp = (device == "cuda") if isinstance(device, str) else (str(device) == "cuda")
+        scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     print("\n" + "=" * 60)
     print("STEP 5: Starting training")
@@ -455,8 +554,12 @@ def train(args):
                             print(f"  [DEBUG]   {k}: {type(v)}")
 
             # F5-TTS CustomDataset returns mel + text in batch
-            mel = batch["mel"].to(device)  # (B, n_mels, T)
-            mel_lengths = batch["mel_lengths"].to(device)
+            if use_accelerate:
+                mel = batch["mel"]
+                mel_lengths = batch["mel_lengths"]
+            else:
+                mel = batch["mel"].to(device)
+                mel_lengths = batch["mel_lengths"].to(device)
             text = batch["text"]
 
             if use_amp:
@@ -474,7 +577,11 @@ def train(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            if use_amp:
+            if use_accelerate:
+                accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+            elif use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -521,10 +628,12 @@ def train(args):
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
             ckpt_path = TRAINING_DIR / f"ckpt_epoch_{epoch+1}.pt"
+            # Unwrap model if using accelerate (DDP wrapper)
+            save_model = accelerator.unwrap_model(model) if use_accelerate else model
             torch.save({
                 "step": global_step,
                 "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": save_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": avg_epoch_loss,
@@ -543,9 +652,12 @@ def train(args):
     print("STEP 6: Saving final model for inference")
     print("=" * 60)
 
+    # Unwrap model if using accelerate
+    save_model = accelerator.unwrap_model(model) if use_accelerate else model
+
     # Save as safetensors with ema_model prefix (what F5-TTS expects for inference)
     final_state = {}
-    for k, v in model.state_dict().items():
+    for k, v in save_model.state_dict().items():
         final_state[f"ema_model.{k}"] = v
 
     final_path = TRAINING_DIR / "model_final.safetensors"
