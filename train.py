@@ -272,7 +272,9 @@ def download_and_load_model(vocab_path: Path, device: str):
         model_embed_size = model.state_dict()[embed_key].shape[0]
         if model_embed_size != pretrained_size:
             print(f"  Resizing text embedding: {pretrained_size} -> {model_embed_size}")
-            new_embed = torch.randn(model_embed_size, pretrained_embed.shape[1]) * 0.02
+            # Initialize new rows with the mean of existing embeddings (stable, no NaN)
+            mean_embed = pretrained_embed.mean(dim=0, keepdim=True)
+            new_embed = mean_embed.expand(model_embed_size, -1).clone()
             # Copy pretrained weights for the overlapping portion
             copy_size = min(pretrained_size, model_embed_size)
             new_embed[:copy_size] = pretrained_embed[:copy_size]
@@ -286,17 +288,6 @@ def download_and_load_model(vocab_path: Path, device: str):
         print(f"  Unexpected keys: {len(unexpected)}")
 
     return model.to(device), vocab_char_map
-
-
-# ============================================================
-# COLLATE FUNCTION
-# ============================================================
-def custom_collate_fn(batch):
-    """Simple collate that keeps audio paths and text as lists."""
-    return {
-        "audio_paths": [item["audio_path"] for item in batch],
-        "texts": [item["text"] for item in batch],
-    }
 
 
 # ============================================================
@@ -345,13 +336,21 @@ def train(args):
     try:
         from f5_tts.model.dataset import CustomDataset, collate_fn as f5_collate_fn
 
+        # Get durations - handle different torchaudio versions
+        def get_audio_duration(path):
+            try:
+                info = torchaudio.info(path)
+                return info.num_frames / info.sample_rate
+            except AttributeError:
+                # Older torchaudio versions don't have torchaudio.info
+                waveform, sr = torchaudio.load(path)
+                return waveform.shape[1] / sr
+
         # Build rows in the format CustomDataset expects
         rows = []
         durations = []
         for entry in dataset.entries:
-            # Get duration
-            info = torchaudio.info(entry["audio_path"])
-            dur = info.num_frames / info.sample_rate
+            dur = get_audio_duration(entry["audio_path"])
             rows.append({
                 "audio_path": entry["audio_path"],
                 "text": entry["text"],
@@ -367,17 +366,17 @@ def train(args):
         use_f5_dataset = True
         print(f"  Using F5-TTS CustomDataset (built-in mel computation)")
     except Exception as e:
-        print(f"  Warning: Could not use F5-TTS CustomDataset: {e}")
-        print(f"  Falling back to manual mel computation")
-        train_ds = dataset
-        use_f5_dataset = False
+        print(f"  ERROR: Could not initialize F5-TTS CustomDataset: {e}")
+        print(f"  Make sure f5-tts is installed: pip install f5-tts")
+        print(f"  And torchaudio is compatible: pip install torchaudio")
+        sys.exit(1)
 
     # DataLoader
     loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=f5_collate_fn if use_f5_dataset else custom_collate_fn,
+        collate_fn=f5_collate_fn,
         num_workers=0,  # Avoid multiprocessing issues on Windows
         pin_memory=True if device == "cuda" else False,
     )
@@ -455,19 +454,22 @@ def train(args):
                         else:
                             print(f"  [DEBUG]   {k}: {type(v)}")
 
-            if use_f5_dataset:
-                # F5-TTS CustomDataset returns mel + text in batch
-                mel = batch["mel"].to(device)  # (B, n_mels, T)
-                mel_lengths = batch["mel_lengths"].to(device)
-                text = batch["text"]
+            # F5-TTS CustomDataset returns mel + text in batch
+            mel = batch["mel"].to(device)  # (B, n_mels, T)
+            mel_lengths = batch["mel_lengths"].to(device)
+            text = batch["text"]
 
-                if use_amp:
-                    with torch.amp.autocast("cuda"):
-                        loss, _, _ = model(mel.permute(0, 2, 1), text=text, lens=mel_lengths)
-                else:
+            if use_amp:
+                with torch.amp.autocast("cuda"):
                     loss, _, _ = model(mel.permute(0, 2, 1), text=text, lens=mel_lengths)
             else:
-                # Manual path (fallback) - shouldn't normally hit this
+                loss, _, _ = model(mel.permute(0, 2, 1), text=text, lens=mel_lengths)
+
+            # Skip NaN losses (can happen in early steps)
+            if torch.isnan(loss) or torch.isinf(loss):
+                if batch_idx < 5:
+                    print(f"  [WARN] NaN/Inf loss at step {global_step+1}, skipping batch")
+                optimizer.zero_grad(set_to_none=True)
                 continue
 
             optimizer.zero_grad(set_to_none=True)
