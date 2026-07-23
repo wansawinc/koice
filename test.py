@@ -245,9 +245,9 @@ Examples:
     parser.add_argument("--vocab", "-v", type=str, default=None,
                         help=f"Vocab path (default: {DEFAULT_VOCAB})")
     parser.add_argument("--ref_audio", "-r", type=str, default=None,
-                        help="Reference audio for voice style")
+                        help="Reference audio for voice cloning (default: dataset/wavs/audio0000001.wav)")
     parser.add_argument("--ref_text", type=str, default=None,
-                        help="Text spoken in reference audio")
+                        help="Text spoken in reference audio (default: from metadata.csv)")
     parser.add_argument("--output", "-o", type=str, default="output.wav",
                         help="Output file path (default: output.wav)")
     parser.add_argument("--speed", "-s", type=float, default=1.0,
@@ -289,6 +289,13 @@ Examples:
         print("ERROR: No reference audio found.")
         print("  Provide one with: --ref_audio path/to/ref.wav")
         sys.exit(1)
+
+    # Make sure gen_text is NOT the same as ref_text
+    if text.strip() == ref_text.strip():
+        print("WARNING: Generation text is same as reference text.")
+        print("  The model will just try to reproduce the reference audio.")
+        print("  Pass different text with: --text \"your new text\"")
+        print()
 
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
