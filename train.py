@@ -726,7 +726,7 @@ def train(args):
         log_file.write(epoch_line + "\n")
         log_file.flush()
 
-        # Save checkpoint
+        # Save checkpoint (keep only last 2)
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
             ckpt_path = TRAINING_DIR / f"ckpt_epoch_{epoch+1}.pt"
             # Unwrap model if using accelerate (DDP wrapper)
@@ -750,6 +750,14 @@ def train(args):
                 # Try saving again
                 torch.save(ckpt_data, ckpt_path)
                 print(f"  Re-saved checkpoint: {ckpt_path}")
+
+            # Delete old checkpoints, keep only last 2
+            existing_ckpts = sorted(TRAINING_DIR.glob("ckpt_epoch_*.pt"),
+                                    key=lambda p: p.stat().st_mtime)
+            while len(existing_ckpts) > 2:
+                old_ckpt = existing_ckpts.pop(0)
+                old_ckpt.unlink()
+                print(f"  Deleted old checkpoint: {old_ckpt.name}")
 
         # Track best
         if avg_epoch_loss < best_loss:
