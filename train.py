@@ -731,7 +731,7 @@ def train(args):
             ckpt_path = TRAINING_DIR / f"ckpt_epoch_{epoch+1}.pt"
             # Unwrap model if using accelerate (DDP wrapper)
             save_model = accelerator.unwrap_model(model) if use_accelerate else model
-            torch.save({
+            ckpt_data = {
                 "step": global_step,
                 "epoch": epoch + 1,
                 "model_state_dict": save_model.state_dict(),
@@ -739,8 +739,17 @@ def train(args):
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": avg_epoch_loss,
                 "config": MODEL_CONFIG,
-            }, ckpt_path)
-            print(f"  Saved checkpoint: {ckpt_path}")
+            }
+            torch.save(ckpt_data, ckpt_path)
+            # Verify checkpoint is readable
+            try:
+                torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                print(f"  Saved checkpoint: {ckpt_path} (verified)")
+            except Exception as e:
+                print(f"  WARNING: Checkpoint may be corrupt: {e}")
+                # Try saving again
+                torch.save(ckpt_data, ckpt_path)
+                print(f"  Re-saved checkpoint: {ckpt_path}")
 
         # Track best
         if avg_epoch_loss < best_loss:
