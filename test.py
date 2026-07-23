@@ -44,9 +44,13 @@ def find_default_ref_audio():
     ref_audio = None
     ref_text = ""
 
+    # Resolve paths relative to script location
+    wavs_dir = WAVS_DIR
+    metadata_csv = METADATA_CSV
+
     # Try to get from metadata.csv
-    if METADATA_CSV.exists():
-        with open(METADATA_CSV, "r", encoding="utf-8") as f:
+    if metadata_csv.exists():
+        with open(metadata_csv, "r", encoding="utf-8") as f:
             f.readline()  # skip header
             line = f.readline().strip()
             if line:
@@ -56,16 +60,24 @@ def find_default_ref_audio():
                     ref_text = parts[1]
                     # Resolve filename
                     audio_file = audio_path.replace("\\", "/").split("/")[-1]
-                    candidate = WAVS_DIR / audio_file
+                    candidate = wavs_dir / audio_file
                     if candidate.exists():
                         ref_audio = str(candidate)
 
-    # Fallback: just pick first wav
-    if ref_audio is None and WAVS_DIR.exists():
-        wavs = sorted(WAVS_DIR.glob("*.wav"))
+    # Fallback: just pick first wav from wavs directory
+    if ref_audio is None and wavs_dir.exists():
+        wavs = sorted(wavs_dir.glob("*.wav"))
         if wavs:
             ref_audio = str(wavs[0])
             ref_text = ""
+
+    # Debug info if nothing found
+    if ref_audio is None:
+        print(f"  [DEBUG] WAVS_DIR: {wavs_dir} (exists: {wavs_dir.exists()})")
+        print(f"  [DEBUG] METADATA_CSV: {metadata_csv} (exists: {metadata_csv.exists()})")
+        if wavs_dir.exists():
+            wav_count = len(list(wavs_dir.glob("*.wav")))
+            print(f"  [DEBUG] WAV files in dir: {wav_count}")
 
     return ref_audio, ref_text
 
